@@ -1,0 +1,2 @@
+-- MERGE logic (staging -> core). See prior message for the full script.
+-- For convenience, drop this into scripts/merge_from_staging.sql in your repo.

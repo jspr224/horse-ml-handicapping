@@ -1,13 +1,16 @@
-
 from __future__ import annotations
+
 import argparse
-import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, Dict, Any
+from typing import Any
+
 from lxml import etree
-from tqdm import tqdm
 from sqlalchemy import text
+from tqdm import tqdm
+
 from hhml.db.connect import get_engine
+
 
 def iter_xml_files(root: Path, kind: str) -> Iterator[Path]:
     exts = (".xml", ".XML")
@@ -15,7 +18,8 @@ def iter_xml_files(root: Path, kind: str) -> Iterator[Path]:
         if p.suffix in exts and kind.lower() in p.parent.name.lower():
             yield p
 
-def parse_race_stub(doc: etree._ElementTree) -> Dict[str, Any]:
+
+def parse_race_stub(doc: etree._ElementTree) -> dict[str, Any]:
     # TODO: Replace with full mapping
     root = doc.getroot()
     track_code = root.findtext("TRACK/CODE") or "UNK"
@@ -34,21 +38,37 @@ def parse_race_stub(doc: etree._ElementTree) -> Dict[str, Any]:
         "track_condition": root.findtext("RACE/TRACK_CONDITION"),
     }
 
-def upsert_race(conn, race: Dict[str, Any]) -> None:
-    sql = text("""        insert into horse_handicapping.race (race_id, track_code, race_date, race_num, surface, distance_yards, field_size, condition_text, track_condition)
-        values (:race_id, :track_code, :race_date, :race_num, :surface, :distance_yards, :field_size, :condition_text, :track_condition)
+
+def upsert_race(conn, race: dict[str, Any]) -> None:
+    sql = text(
+        """
+        insert into horse_handicapping.race (
+            race_id, track_code, race_date, race_num, surface, distance_yards,
+            field_size, condition_text, track_condition
+        )
+        values (
+            :race_id, :track_code, :race_date, :race_num, :surface, :distance_yards,
+            :field_size, :condition_text, :track_condition
+        )
         on conflict (race_id) do update set
-          surface = excluded.surface,
-          distance_yards = excluded.distance_yards,
-          field_size = excluded.field_size,
-          condition_text = excluded.condition_text,
-          track_condition = excluded.track_condition
-    """)
+            surface = excluded.surface,
+            distance_yards = excluded.distance_yards,
+            field_size = excluded.field_size,
+            condition_text = excluded.condition_text,
+            track_condition = excluded.track_condition
+        """
+    )
     conn.execute(sql, race)
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="in_dir", required=True, help="Root path with XML folders (e.g., data/raw/2023)")
+    ap.add_argument(
+        "--in",
+        dest="in_dir",
+        required=True,
+        help="Root path with XML folders (e.g., data/raw/2023)",
+    )
     ap.add_argument("--kind", choices=["results", "charts", "pp"], default="results")
     ap.add_argument("--limit", type=int, default=0, help="Parse only the first N files (0 for all)")
     ap.add_argument("--echo", action="store_true", help="SQL echo")
@@ -69,6 +89,7 @@ def main():
                 upsert_race(conn, race)
             except Exception as e:
                 print(f"ERROR: {p} -> {e}")
+
 
 if __name__ == "__main__":
     main()
