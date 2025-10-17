@@ -1,0 +1,39 @@
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.venv*/
+env/
+venv/
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Data
+data/**
+!data/.gitkeep
+!data/raw/
+!data/interim/
+!data/processed/
+data/raw/**
+data/interim/**
+data/processed/**
+
+# Secrets
+.env
+*.key
+*.pem
+*.crt
+
+# Logs & artifacts
+logs/
+outputs/
+models/

@@ -1,0 +1,16 @@
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+skip-string-normalization = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E","F","I","UP"]
+ignore = []
+exclude = ["data","notebooks","models","outputs"]
+
+[tool.ruff.isort]
+known-first-party = ["hhml"]
+profile = "black"

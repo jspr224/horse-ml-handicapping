@@ -1,0 +1,25 @@
+
+name: hhml
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pandas
+  - lxml
+  - sqlalchemy
+  - psycopg
+  - python-dotenv
+  - tqdm
+  - pyyaml
+  - scikit-learn
+  - lightgbm
+  - xgboost
+  - matplotlib
+  - seaborn
+  - requests
+  - pip:
+      - pre-commit
+      - ruff
+      - black
+      - pytest
