@@ -46,43 +46,51 @@ def register_file(engine: Engine, p: Path, track_code: str | None, race_date: st
         return res.scalar_one()
 
 
-def _emit_rows_pp(doc: etree._ElementTree) -> dict[str, list[dict[str, Any]]]:
+def _emit_rows_pp(
+    doc: etree._ElementTree,
+    default_track: str | None = None,
+    default_date: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     root = doc.getroot()
 
-    # Best-effort tag lookups to handle minor schema/name variance.
-    def t(*paths: str) -> str | None:
-        for path in paths:
-            v = root.findtext(path)
-            if v:
-                return v.strip()
+    # Helpers
+    def first_text(node, *paths: str) -> str | None:
+        for p in paths:
+            v = node.findtext(p)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
         return None
 
-    track = (t(".//Track/Code", ".//TRACK/CODE") or "UNK").strip()
-    rdate = (t(".//RaceDate", ".//RACE_DATE") or "").strip()
+    # File-level metadata: prefer filename-derived defaults if XML is sparse
+    track = (first_text(root, ".//Track/Code", ".//TRACK/CODE") or default_track or "UNK").strip()
+    rdate = (first_text(root, ".//RaceDate", ".//RACE_DATE") or default_date or "").strip()
 
     race_rows: list[dict[str, Any]] = []
     entry_rows: list[dict[str, Any]] = []
     work_rows: list[dict[str, Any]] = []
 
-    # Races
-    for race in root.findall(".//Race"):
+    # Races (support mixed casing / attributes)
+    for race in root.findall(".//Race") + root.findall(".//RACE"):
+        # robust race number extraction
+        rnum_txt = (
+            first_text(race, "Number", "NUMBER", "RaceNumber", "RACE_NUMBER")
+            or race.get("Number")
+            or race.get("NUMBER")
+            or race.get("num")
+        )
+        rnum = safe_int(rnum_txt)
+        if rnum is None:
+            # Skip malformed blocks to avoid NOT NULL failures downstream
+            continue
 
-        def rt(node, *paths):
-            for pth in paths:
-                v = node.findtext(pth)
-                if v:
-                    return v.strip()
-            return None
-
-        rnum = safe_int(rt(race, "Number", "NUMBER"))
-        surface = rt(race, "Surface", "SURFACE")
-        distance_yd = safe_int(rt(race, "DistanceYards", "DISTANCE_YARDS"))
-        condition = rt(race, "TrackCondition", "TRACK_CONDITION")
-        age_restr = rt(race, "AgeRestriction", "AGE_RESTRICTION")
-        sex_restr = rt(race, "SexRestriction", "SEX_RESTRICTION")
-        purse = safe_int(rt(race, "Purse", "PURSE"))
-        wager_text = rt(race, "WagerText")
-        prog_sel = rt(race, "ProgramSelections")
+        surface = first_text(race, "Surface", "SURFACE")
+        distance_yd = safe_int(first_text(race, "DistanceYards", "DISTANCE_YARDS", "DistanceYd"))
+        condition = first_text(race, "TrackCondition", "TRACK_CONDITION", "Condition")
+        age_restr = first_text(race, "AgeRestriction", "AGE_RESTRICTION")
+        sex_restr = first_text(race, "SexRestriction", "SEX_RESTRICTION")
+        purse = safe_int(first_text(race, "Purse", "PURSE"))
+        wager_text = first_text(race, "WagerText", "WAGER_TEXT")
+        prog_sel = first_text(race, "ProgramSelections", "PROGRAM_SELECTIONS")
 
         row = {
             "track_code": track,
@@ -102,24 +110,20 @@ def _emit_rows_pp(doc: etree._ElementTree) -> dict[str, list[dict[str, Any]]]:
         race_rows.append(row)
 
         # Entries
-        for e in race.findall(".//Starter"):
+        for e in race.findall(".//Starter") + race.findall(".//STARTER"):
 
             def et(node, *paths):
-                for pth in paths:
-                    v = node.findtext(pth)
-                    if v:
-                        return v.strip()
-                return None
+                return first_text(node, *paths)
 
             prog = et(e, "Program", "PROGRAM")
             horse = et(e, "HorseName", "HORSE_NAME")
-            sire = et(e, "Sire")
-            dam = et(e, "Dam")
+            sire = et(e, "Sire", "SIRE")
+            dam = et(e, "Dam", "DAM")
             trainer = et(e, "TrainerName", "TRAINER_NAME")
             jockey = et(e, "JockeyName", "JOCKEY_NAME")
 
-            med = (et(e, "Medication") or "").upper()
-            eqp = (et(e, "Equipment") or "").upper()
+            med = (et(e, "Medication", "MEDICATION") or "").upper()
+            eqp = (et(e, "Equipment", "EQUIPMENT") or "").upper()
             lasix = "LASIX" in med if med else None
             blinkers = "BLINK" in eqp if eqp else None
 
@@ -129,7 +133,7 @@ def _emit_rows_pp(doc: etree._ElementTree) -> dict[str, list[dict[str, Any]]]:
             pf2 = safe_int(et(e, "PaceFigure2", "PACE_FIGURE2"))
             pf3 = safe_int(et(e, "PaceFigure3", "PACE_FIGURE3"))
             cr = safe_int(et(e, "ClassRating", "CLASS_RATING"))
-            cmt = et(e, "ShortComment", "LONG_COMMENT")
+            cmt = et(e, "ShortComment", "LONG_COMMENT", "COMMENT")
 
             erow = {
                 "track_code": track,
@@ -155,19 +159,15 @@ def _emit_rows_pp(doc: etree._ElementTree) -> dict[str, list[dict[str, Any]]]:
             entry_rows.append(erow)
 
     # Workouts may be outside Race nodes
-    for w in root.findall(".//Workout"):
+    for w in root.findall(".//Workout") + root.findall(".//WORKOUT"):
 
         def wt(node, *paths):
-            for pth in paths:
-                v = node.findtext(pth)
-                if v:
-                    return v.strip()
-            return None
+            return first_text(node, *paths)
 
         wrow = {
             "horse_name": wt(w, "HorseName", "HORSE_NAME"),
             "work_date": wt(w, "Date", "DATE"),
-            "track_code": wt(w, "Track", "TRACK"),
+            "track_code": wt(w, "Track", "TRACK") or track,
             "distance_furlongs": safe_float(wt(w, "DistanceFurlongs", "DIST_FURLONGS")),
             "surface": wt(w, "Surface", "SURFACE"),
             "course_type": wt(w, "CourseType", "COURSE_TYPE"),
@@ -296,7 +296,7 @@ def main() -> None:
             track = track or trk
 
         file_id = register_file(engine, p, track, rdate)
-        rows = _emit_rows_pp(doc)
+        rows = _emit_rows_pp(doc, default_track=track, default_date=rdate)
         _upsert_staging(engine, file_id, rows)
 
 
