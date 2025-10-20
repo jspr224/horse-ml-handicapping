@@ -109,31 +109,47 @@ def _emit_rows_pp(
         row["row_fingerprint"] = fingerprint(row)
         race_rows.append(row)
 
-        # Entries
-        for e in race.findall(".//Starter") + race.findall(".//STARTER"):
+        # Entries (support multiple tag names and field fallbacks)
+        entry_nodes = []
+        for tag in ("Starter", "STARTER", "Entry", "ENTRY", "Horse", "HORSE", "Runner", "RUNNER"):
+            entry_nodes.extend(race.findall(f".//{tag}"))
 
-            def et(node, *paths):
-                return first_text(node, *paths)
+        def et(node, *paths):
+            # try child text first
+            for p in paths:
+                v = node.findtext(p)
+                if v is not None and str(v).strip() != "":
+                    return str(v).strip()
+            # then attributes (some dumps store PP/NUMBER as attr)
+            for p in paths:
+                if p in node.attrib and str(node.attrib[p]).strip() != "":
+                    return node.attrib[p].strip()
+            return None
 
-            prog = et(e, "Program", "PROGRAM")
-            horse = et(e, "HorseName", "HORSE_NAME")
+        for e in entry_nodes:
+            prog = et(e, "Program", "PROGRAM", "PostPosition", "POST_POSITION", "PP", "NUMBER")
+            horse = et(e, "HorseName", "HORSE_NAME", "Name", "NAME")
             sire = et(e, "Sire", "SIRE")
             dam = et(e, "Dam", "DAM")
-            trainer = et(e, "TrainerName", "TRAINER_NAME")
-            jockey = et(e, "JockeyName", "JOCKEY_NAME")
+            trainer = et(e, "TrainerName", "TRAINER_NAME", "Trainer", "TRAINER")
+            jockey = et(e, "JockeyName", "JOCKEY_NAME", "Jockey", "JOCKEY")
 
             med = (et(e, "Medication", "MEDICATION") or "").upper()
             eqp = (et(e, "Equipment", "EQUIPMENT") or "").upper()
             lasix = "LASIX" in med if med else None
             blinkers = "BLINK" in eqp if eqp else None
 
-            ml_odds = et(e, "MorningLine", "MORNING_LINE")
-            spd = safe_int(et(e, "SpeedFigure", "SPEED_FIGURE"))
-            pf1 = safe_int(et(e, "PaceFigure1", "PACE_FIGURE1"))
-            pf2 = safe_int(et(e, "PaceFigure2", "PACE_FIGURE2"))
-            pf3 = safe_int(et(e, "PaceFigure3", "PACE_FIGURE3"))
-            cr = safe_int(et(e, "ClassRating", "CLASS_RATING"))
-            cmt = et(e, "ShortComment", "LONG_COMMENT", "COMMENT")
+            ml_odds = et(e, "MorningLine", "MORNING_LINE", "ML")
+            spd = safe_int(et(e, "SpeedFigure", "SPEED_FIGURE", "Speed", "SPEED"))
+            pf1 = safe_int(et(e, "PaceFigure1", "PACE_FIGURE1", "Pace1", "PACE1"))
+            pf2 = safe_int(et(e, "PaceFigure2", "PACE_FIGURE2", "Pace2", "PACE2"))
+            pf3 = safe_int(et(e, "PaceFigure3", "PACE_FIGURE3", "Pace3", "PACE3"))
+            cr = safe_int(et(e, "ClassRating", "CLASS_RATING", "Class", "CLASS"))
+            cmt = et(e, "ShortComment", "LONG_COMMENT", "Comment", "COMMENT")
+
+            # need *something* to identify an entry
+            if not (prog or horse):
+                continue
 
             erow = {
                 "track_code": track,
