@@ -255,7 +255,38 @@ def _emit_rows_pp(
             return None
 
         for e in entry_nodes:
-            prog = get_program_number(e)
+            # --- Program number (robust) ---
+            # Try common node names first
+            prog = first_text(
+                e,
+                "Program",
+                "PROGRAM",
+                "Prog",
+                "PROG",
+                "Saddle",
+                "SADDLE",
+                "PP",
+                "POST_POSITION",
+                "PostPosition",
+                "POST",
+                "ENTRY_NUMBER",
+            )
+
+            # Some feeds put it on the <Entry>/<Starter> node as an attribute
+            if not prog:
+                for attr in ("program", "PROGRAM", "pp", "PP", "post", "POST"):
+                    v = e.get(attr)
+                    if v and v.strip():
+                        prog = v.strip()
+                        break
+
+            # Normalize: allow 1–2 digits plus optional A/B/C suffix (e.g., "1", "1A", "12B")
+            if prog:
+                import re
+
+                m = re.match(r"^\s*(\d{1,2})([A-C]?)\s*$", prog)
+                prog = m.group(0).strip() if m else None
+
             horse = et(e, "HorseName", "HORSE_NAME", "Name", "NAME")
             sire = et(e, "Sire", "SIRE")
             dam = et(e, "Dam", "DAM")
@@ -274,13 +305,6 @@ def _emit_rows_pp(
             pf3 = safe_int(et(e, "PaceFigure3", "PACE_FIGURE3", "Pace3", "PACE3"))
             cr = safe_int(et(e, "ClassRating", "CLASS_RATING", "Class", "CLASS"))
             cmt = et(e, "ShortComment", "LONG_COMMENT", "Comment", "COMMENT")
-
-            # ensure we have some identifier
-            if not prog:
-                if horse:
-                    prog = horse
-                else:
-                    continue
 
             erow = {
                 "track_code": track,
