@@ -63,7 +63,7 @@ def _emit_rows_pp(
 
     # File-level metadata: prefer filename-derived defaults if XML is sparse
     track = (first_text(root, ".//Track/Code", ".//TRACK/CODE") or default_track or "UNK").strip()
-    rdate = (first_text(root, ".//RaceDate", ".//RACE_DATE") or default_date or "").strip()
+    rdate = (default_date or first_text(root, ".//RaceDate", ".//RACE_DATE") or "").strip()
 
     race_rows: list[dict[str, Any]] = []
     entry_rows: list[dict[str, Any]] = []
@@ -176,6 +176,14 @@ def _emit_rows_pp(
             "time_raw": wt(w, "Time", "TIME"),
             "bullet_flag": (wt(w, "Bullet", "BULLET") or "").upper() in ("Y", "TRUE", "1"),
         }
+
+        # NEW: drop malformed workouts (prevents NOT NULL errors)
+        if not wrow["horse_name"]:
+            continue
+        # optional: also require distance
+        # if not wrow["distance_furlongs"]:
+        #     continue
+
         wrow["row_fingerprint"] = fingerprint(wrow)
         work_rows.append(wrow)
 
