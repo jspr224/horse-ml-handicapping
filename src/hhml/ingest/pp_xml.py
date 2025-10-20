@@ -2,28 +2,103 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from lxml import etree
+from lxml import etree  # type: ignore
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
+# Project engine helper
 from hhml.db.connect import get_engine
-from hhml.ingest.utils import fingerprint, safe_float, safe_int
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+
+
+def safe_int(x: Any) -> int | None:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def safe_float(x: Any) -> float | None:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def fingerprint(row: dict[str, Any]) -> str:
+    """Stable row fingerprint for idempotent upserts."""
+    canon = json.dumps(row, sort_keys=True, separators=(",", ":"))
+    return hashlib.md5(canon.encode("utf-8")).hexdigest()
+
+
+# -----------------------------
+# Filename-derived defaults
+# -----------------------------
+
+_DATE_RE = re.compile(r"(20\d{2})(\d{2})(\d{2})")
+_TRACK_RE = re.compile(r"([A-Z]{2,4})[_\.]")
+
+
+def _defaults_from_filename(p: Path) -> tuple[str | None, str | None]:
+    name = p.name
+
+    # date like 20230422
+    rdate: str | None = None
+    m = _DATE_RE.search(name)
+    if m:
+        try:
+            rdate = datetime.strptime("".join(m.groups()), "%Y%m%d").date().isoformat()
+        except Exception:
+            rdate = None
+
+    # track code: try the block of caps before underscore or dot (e.g., KEE in *_KEE_USA.xml)
+    track: str | None = None
+    # Prefer pattern like ...YYYYMMDDKEE_USA.xml
+    m2 = re.search(r"20\d{6}([A-Z]{2,4})[_\.]", name)
+    if m2:
+        track = m2.group(1)
+    else:
+        m3 = _TRACK_RE.search(name)
+        if m3:
+            track = m3.group(1)
+
+    return track, rdate
+
+
+# -----------------------------
+# DB helpers
+# -----------------------------
 
 
 def _sha256_file(p: Path) -> str:
     h = hashlib.sha256()
     with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def register_file(engine: Engine, p: Path, track_code: str | None, race_date: str | None) -> int:
-    """Register file in raw_ingest_file; idempotent on file_hash."""
-    file_hash = _sha256_file(p)
+def register_file(engine, path: Path, track_code: str | None, race_date: str | None) -> int:
+    """Insert or update raw_ingest_file and return file_id."""
+    fhash = _sha256_file(path)
     with engine.begin() as conn:
         res = conn.execute(
             text(
@@ -39,11 +114,17 @@ def register_file(engine: Engine, p: Path, track_code: str | None, race_date: st
             {
                 "track_code": track_code,
                 "race_date": race_date,
-                "file_name": p.name,
-                "file_hash": file_hash,
+                "file_name": path.name,
+                "file_hash": fhash,
             },
         )
-        return res.scalar_one()
+        fid = res.scalar_one()
+    return int(fid)
+
+
+# -----------------------------
+# XML extraction
+# -----------------------------
 
 
 def _emit_rows_pp(
@@ -53,7 +134,6 @@ def _emit_rows_pp(
 ) -> dict[str, list[dict[str, Any]]]:
     root = doc.getroot()
 
-    # Helpers
     def first_text(node, *paths: str) -> str | None:
         for p in paths:
             v = node.findtext(p)
@@ -61,38 +141,46 @@ def _emit_rows_pp(
                 return str(v).strip()
         return None
 
-    # File-level metadata: prefer filename-derived defaults if XML is sparse
     track = (first_text(root, ".//Track/Code", ".//TRACK/CODE") or default_track or "UNK").strip()
+    # Prefer filename date if provided, else fall back to XML
     rdate = (default_date or first_text(root, ".//RaceDate", ".//RACE_DATE") or "").strip()
 
     race_rows: list[dict[str, Any]] = []
     entry_rows: list[dict[str, Any]] = []
     work_rows: list[dict[str, Any]] = []
 
-    # Races (support mixed casing / attributes)
+    # ---- Races ----
     for race in root.findall(".//Race") + root.findall(".//RACE"):
-        # robust race number extraction
+
+        def rt(node, *paths):
+            for pth in paths:
+                v = node.findtext(pth)
+                if v is not None and str(v).strip() != "":
+                    return str(v).strip()
+            return None
+
+        # race number with robust fallbacks (tags and attributes)
         rnum_txt = (
-            first_text(race, "Number", "NUMBER", "RaceNumber", "RACE_NUMBER")
+            rt(race, "Number", "NUMBER", "RaceNumber", "RACE_NUMBER")
             or race.get("Number")
             or race.get("NUMBER")
             or race.get("num")
         )
         rnum = safe_int(rnum_txt)
         if rnum is None:
-            # Skip malformed blocks to avoid NOT NULL failures downstream
+            # skip malformed races to satisfy NOT NULL
             continue
 
-        surface = first_text(race, "Surface", "SURFACE")
-        distance_yd = safe_int(first_text(race, "DistanceYards", "DISTANCE_YARDS", "DistanceYd"))
-        condition = first_text(race, "TrackCondition", "TRACK_CONDITION", "Condition")
-        age_restr = first_text(race, "AgeRestriction", "AGE_RESTRICTION")
-        sex_restr = first_text(race, "SexRestriction", "SEX_RESTRICTION")
-        purse = safe_int(first_text(race, "Purse", "PURSE"))
-        wager_text = first_text(race, "WagerText", "WAGER_TEXT")
-        prog_sel = first_text(race, "ProgramSelections", "PROGRAM_SELECTIONS")
+        surface = rt(race, "Surface", "SURFACE")
+        distance_yd = safe_int(rt(race, "DistanceYards", "DISTANCE_YARDS", "DistanceYd"))
+        condition = rt(race, "TrackCondition", "TRACK_CONDITION", "Condition")
+        age_restr = rt(race, "AgeRestriction", "AGE_RESTRICTION")
+        sex_restr = rt(race, "SexRestriction", "SEX_RESTRICTION")
+        purse = safe_int(rt(race, "Purse", "PURSE"))
+        wager_text = rt(race, "WagerText", "WAGER_TEXT")
+        prog_sel = rt(race, "ProgramSelections", "PROGRAM_SELECTIONS")
 
-        row = {
+        rrow = {
             "track_code": track,
             "race_date": rdate,
             "race_number": rnum,
@@ -106,28 +194,68 @@ def _emit_rows_pp(
             "wager_text": wager_text,
             "program_selections": prog_sel,
         }
-        row["row_fingerprint"] = fingerprint(row)
-        race_rows.append(row)
+        rrow["row_fingerprint"] = fingerprint(rrow)
+        race_rows.append(rrow)
 
-        # Entries (support multiple tag names and field fallbacks)
+        # ---- Entries ----
         entry_nodes = []
         for tag in ("Starter", "STARTER", "Entry", "ENTRY", "Horse", "HORSE", "Runner", "RUNNER"):
             entry_nodes.extend(race.findall(f".//{tag}"))
 
         def et(node, *paths):
-            # try child text first
+            # child text
             for p in paths:
                 v = node.findtext(p)
                 if v is not None and str(v).strip() != "":
                     return str(v).strip()
-            # then attributes (some dumps store PP/NUMBER as attr)
+            # attribute
             for p in paths:
                 if p in node.attrib and str(node.attrib[p]).strip() != "":
                     return node.attrib[p].strip()
             return None
 
+        def get_program_number(n) -> str | None:
+            val = et(
+                n,
+                "Program",
+                "PROGRAM",
+                "PostPosition",
+                "POST_POSITION",
+                "PP",
+                "Number",
+                "NUMBER",
+                "ProgNum",
+                "PROGNUM",
+                "ProgramNumber",
+                "PROGRAM_NUMBER",
+                "SaddleCloth",
+                "SADDLE_CLOTH",
+                "EntryNumber",
+                "ENTRY_NUMBER",
+            )
+            if val:
+                return val
+            # descendant sweep for common names
+            try:
+                for name in (
+                    "Program",
+                    "PROGRAM",
+                    "PostPosition",
+                    "POST_POSITION",
+                    "PP",
+                    "Number",
+                    "NUMBER",
+                ):
+                    hits = n.xpath(f".//*[local-name()='{name}']/text()")
+                    for h in hits:
+                        if str(h).strip():
+                            return str(h).strip()
+            except Exception:
+                pass
+            return None
+
         for e in entry_nodes:
-            prog = et(e, "Program", "PROGRAM", "PostPosition", "POST_POSITION", "PP", "NUMBER")
+            prog = get_program_number(e)
             horse = et(e, "HorseName", "HORSE_NAME", "Name", "NAME")
             sire = et(e, "Sire", "SIRE")
             dam = et(e, "Dam", "DAM")
@@ -147,9 +275,12 @@ def _emit_rows_pp(
             cr = safe_int(et(e, "ClassRating", "CLASS_RATING", "Class", "CLASS"))
             cmt = et(e, "ShortComment", "LONG_COMMENT", "Comment", "COMMENT")
 
-            # need *something* to identify an entry
-            if not (prog or horse):
-                continue
+            # ensure we have some identifier
+            if not prog:
+                if horse:
+                    prog = horse
+                else:
+                    continue
 
             erow = {
                 "track_code": track,
@@ -174,11 +305,15 @@ def _emit_rows_pp(
             erow["row_fingerprint"] = fingerprint(erow)
             entry_rows.append(erow)
 
-    # Workouts may be outside Race nodes
+    # ---- Workouts (often outside Race) ----
     for w in root.findall(".//Workout") + root.findall(".//WORKOUT"):
 
         def wt(node, *paths):
-            return first_text(node, *paths)
+            for p in paths:
+                v = node.findtext(p)
+                if v is not None and str(v).strip() != "":
+                    return str(v).strip()
+            return None
 
         wrow = {
             "horse_name": wt(w, "HorseName", "HORSE_NAME"),
@@ -193,12 +328,8 @@ def _emit_rows_pp(
             "bullet_flag": (wt(w, "Bullet", "BULLET") or "").upper() in ("Y", "TRUE", "1"),
         }
 
-        # NEW: drop malformed workouts (prevents NOT NULL errors)
         if not wrow["horse_name"]:
             continue
-        # optional: also require distance
-        # if not wrow["distance_furlongs"]:
-        #     continue
 
         wrow["row_fingerprint"] = fingerprint(wrow)
         work_rows.append(wrow)
@@ -206,7 +337,12 @@ def _emit_rows_pp(
     return {"race": race_rows, "entry": entry_rows, "workout": work_rows}
 
 
-def _upsert_staging(engine: Engine, file_id: int, rows: dict[str, Any]) -> None:
+# -----------------------------
+# Upsert staging tables
+# -----------------------------
+
+
+def _upsert_staging(engine, file_id: int, rows: dict[str, list[dict[str, Any]]]) -> None:
     with engine.begin() as conn:
         if rows["race"]:
             conn.execute(
@@ -233,9 +369,8 @@ def _upsert_staging(engine: Engine, file_id: int, rows: dict[str, Any]) -> None:
                       row_fingerprint = excluded.row_fingerprint
                     """
                 ),
-                [{"fid": file_id, **r} for r in rows["race"]],
+                [dict(fid=file_id, **r) for r in rows["race"]],
             )
-
         if rows["entry"]:
             conn.execute(
                 text(
@@ -252,8 +387,7 @@ def _upsert_staging(engine: Engine, file_id: int, rows: dict[str, Any]) -> None:
                      :med_lasix, :equip_blinkers, :ml_odds, :speed_fig_last,
                      :pace_fig1, :pace_fig2, :pace_fig3, :class_rating,
                      :last_comment, :row_fingerprint)
-                    on conflict
-                    (source_file_id, track_code, race_date, race_number, program_number)
+                    on conflict (source_file_id, track_code, race_date, race_number, program_number)
                     do update set
                       horse_name = excluded.horse_name,
                       trainer_name = excluded.trainer_name,
@@ -268,9 +402,8 @@ def _upsert_staging(engine: Engine, file_id: int, rows: dict[str, Any]) -> None:
                       row_fingerprint = excluded.row_fingerprint
                     """
                 ),
-                [{"fid": file_id, **e} for e in rows["entry"]],
+                [dict(fid=file_id, **r) for r in rows["entry"]],
             )
-
         if rows["workout"]:
             conn.execute(
                 text(
@@ -283,45 +416,48 @@ def _upsert_staging(engine: Engine, file_id: int, rows: dict[str, Any]) -> None:
                     (:fid, :horse_name, :work_date, :track_code, :distance_furlongs,
                      :surface, :course_type, :rank_in_set, :set_size, :time_raw,
                      :bullet_flag, :row_fingerprint)
-                    on conflict
-                    (source_file_id, horse_name, work_date, track_code, distance_furlongs)
+                    on conflict (source_file_id, horse_name, work_date,
+                                 track_code, distance_furlongs)
                     do update set
                       time_raw = excluded.time_raw,
                       bullet_flag = excluded.bullet_flag,
                       row_fingerprint = excluded.row_fingerprint
                     """
                 ),
-                [{"fid": file_id, **w} for w in rows["workout"]],
+                [dict(fid=file_id, **r) for r in rows["workout"]],
             )
 
 
+# -----------------------------
+# CLI
+# -----------------------------
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("xml", nargs="+", help="One or more SIMD*.xml PP files")
-    ap.add_argument("--track", help="Override track code", required=False)
-    ap.add_argument("--date", help="Override race date YYYY-MM-DD", required=False)
-    ap.add_argument("--echo", action="store_true")
+    ap = argparse.ArgumentParser(description="Parse Equibase PP XML to staging")
+    ap.add_argument("xml_path", type=str, help="Path to PP XML file")
+    ap.add_argument("--echo", action="store_true", help="Echo SQL (via engine echo)")
     args = ap.parse_args()
 
+    p = Path(args.xml_path).expanduser().resolve()
+    if not p.exists():
+        raise SystemExit(f"File not found: {p}")
+
+    # Engine (respect global echo if flag is set by temporarily creating)
     engine = get_engine(echo=args.echo)
 
-    for x in args.xml:
-        p = Path(x)
-        doc = etree.parse(str(p))
+    # Filename defaults
+    d_track, d_date = _defaults_from_filename(p)
 
-        # Derive track/date from filename if missing (SIMDYYYYMMDDTRK_*.xml)
-        track = args.track
-        rdate = args.date
-        stem = p.stem
-        if (not track or not rdate) and stem.startswith("SIMD") and len(stem) >= 15:
-            yyyymmdd = stem[4:12]
-            trk = stem[12:15]
-            rdate = rdate or f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}"
-            track = track or trk
+    # Parse XML
+    doc = etree.parse(str(p))
 
-        file_id = register_file(engine, p, track, rdate)
-        rows = _emit_rows_pp(doc, default_track=track, default_date=rdate)
-        _upsert_staging(engine, file_id, rows)
+    # Register file and extract rows
+    file_id = register_file(engine, p, d_track, d_date)
+    rows = _emit_rows_pp(doc, default_track=d_track, default_date=d_date)
+
+    # Upsert staging
+    _upsert_staging(engine, file_id, rows)
 
 
 if __name__ == "__main__":
