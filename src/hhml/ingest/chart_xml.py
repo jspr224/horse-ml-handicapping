@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,287 +12,338 @@ from sqlalchemy import text
 
 from hhml.db.connect import get_engine
 from hhml.db.files import register_file
-from hhml.utils import fingerprint, first_text, safe_float, safe_int
+from hhml.utils import fingerprint, safe_float, safe_int
+
+SCHEMA = "horse_handicapping"
+
 
 # -----------------------------
-# Helpers
+# XML helpers (namespace-agnostic)
 # -----------------------------
+def first_text(node: etree._Element, *names: str) -> str | None:
+    for nm in names:
+        hits = node.xpath(f"./*[local-name()='{nm}']/text()")
+        if hits:
+            v = str(hits[0]).strip()
+            if v != "":
+                return v
+    return None
 
 
-def _defaults_from_filename(p: Path) -> tuple[str | None, str | None]:
+def findall(node: etree._Element, *names: str) -> list[etree._Element]:
+    out: list[etree._Element] = []
+    for nm in names:
+        out.extend(node.xpath(f".//*[local-name()='{nm}']"))
+    return out
+
+
+# -----------------------------
+# Distance/SURFACE helpers
+# -----------------------------
+def yards_from_furlongs_miles(dist_str: str | None) -> int | None:
     """
-    Infer (track_code, race_date) from filenames like:
-      kee20231014tch.xml  -> (KEE, 2023-10-14)
-      KEE20231014TCH.XML  -> (KEE, 2023-10-14)
-    If pattern doesn't match, return (None, None).
+    Convert chart-style distance strings to yards.
+    Examples: "6 Furlongs" -> 1320, "1 Mile" -> 1760, "1 1/16 Miles" -> 1870
     """
-    stem = p.name
-    try:
-        s = stem.lower()
-        # expect: <track:3 letters><yyyymmdd>tch
-        # find the date block:
+    if not dist_str:
+        return None
+    s = dist_str.lower().strip()
+    # Furlongs simple
+    if "furlong" in s:
         import re
 
-        m = re.search(r"([a-z]{3})?(\d{8})tch", s)
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
         if not m:
-            return None, None
-        track = (m.group(1) or "").upper() if m.group(1) else None
-        ymd = m.group(2)
-        rdate = f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
-        return track, rdate
-    except Exception:
-        return None, None
+            return None
+        furlongs = float(m.group(1))
+        return int(round(furlongs * 220))
+
+    # Miles with optional fractions
+    if "mile" in s:
+        # Examples: "1 Mile", "1 1/16 Miles", "1 1/8 Miles", "1 3/8 Miles"
+        import re
+
+        parts = s.split("mile")[0].strip()
+        # mixed fraction like "1 1/16"
+        m_mixed = re.match(r"^\s*(\d+)\s+(\d+)/(\d+)", parts)
+        if m_mixed:
+            whole = float(m_mixed.group(1))
+            num = float(m_mixed.group(2))
+            den = float(m_mixed.group(3))
+            miles = whole + (num / den)
+        else:
+            m_simple = re.match(r"^\s*(\d+(?:\.\d+)?)", parts)
+            if not m_simple:
+                return None
+            miles = float(m_simple.group(1))
+        return int(round(miles * 1760))
+
+    return None
 
 
-def _yards_from_distance(dist_raw: str | None, dist_unit: str | None) -> int | None:
-    """
-    Equibase Chart XML encodes DISTANCE with a companion DIST_UNIT.
-    In your sample, DIST_UNIT is 'F' (furlongs) and DISTANCE is like 650 = 6.5f.
-    Convert to yards:
-      Furlong -> 220 yards
-      Mile    -> 1760 yards
-      Yard    -> 1 yard
-    Unknown -> None
-    """
-    d = safe_float(dist_raw)
-    if d is None:
+def surface_code(val: str | None) -> str | None:
+    if not val:
         return None
-    unit = (dist_unit or "").strip().upper()
-    # In TCH files, distance is coded in hundredths of a unit (e.g., 650 -> 6.50 furlongs)
-    val_units = d / 100.0
-
-    if unit == "F":  # furlongs
-        yards = val_units * 220.0
-    elif unit == "M":  # miles
-        yards = val_units * 1760.0
-    elif unit == "Y":  # yards
-        yards = val_units  # already yards
-    else:
-        return None
-
-    return int(round(yards))
+    v = val.strip().upper()
+    if v.startswith("TURF"):
+        return "T"
+    if v.startswith("DIRT"):
+        return "D"
+    if v.startswith("ALL WEATHER") or v.startswith("SYN"):
+        return "A"
+    return v[:1] if v else None
 
 
-def _emit_rows_chart(
-    doc: etree._ElementTree, default_track: str | None, default_date: str | None
+# -----------------------------
+# Row containers
+# -----------------------------
+@dataclass
+class RaceRow:
+    track_code: str | None
+    race_date: str | None
+    race_number: int | None
+    surface: str | None
+    distance_yards: int | None
+    track_condition: str | None
+
+
+@dataclass
+class EntryRow:
+    track_code: str
+    race_date: str
+    race_number: int
+    program_number: str
+    horse_name: str
+    finish_position: int | None
+    final_odds: float | None
+    win_payoff: float | None
+    place_payoff: float | None
+    show_payoff: float | None
+
+
+# -----------------------------
+# Emit rows from XML (Equibase TCH)
+# -----------------------------
+def emit_rows_chart(
+    doc: etree._ElementTree,
+    default_track: str | None,
+    default_date: str | None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """
-    Parse Equibase TCH (charts) XML into staging row dicts.
-    Produces keys: race, entry, payout, scratch
-    """
     root = doc.getroot()
+
+    # Track and date at meet level if present; fall back to filename defaults
+    tcode = first_text(root, "TrackCode", "TRACK_CODE") or default_track
+    rdate = first_text(root, "RaceDate", "RACE_DATE") or default_date
 
     race_rows: list[dict[str, Any]] = []
     entry_rows: list[dict[str, Any]] = []
-    payout_rows: list[dict[str, Any]] = []
-    scratch_rows: list[dict[str, Any]] = []
 
-    # Track/date from filename (TCH files usually lack a single header code)
-    track = default_track
-    rdate = default_date
+    race_nodes = findall(root, "Race", "RACE")
 
-    # Iterate races
-    for r in root.findall(".//RACE"):
-        rnum = safe_int(r.get("NUMBER")) or safe_int(first_text(r, "RACE_NUMBER"))
-        surface = first_text(r, "SURFACE")  # e.g., 'D', 'T'
-        trk_cond = first_text(r, "TRK_COND")  # e.g., 'FT', 'GD', ...
-        dist_raw = first_text(r, "DISTANCE")
-        dist_unit = first_text(r, "DIST_UNIT")
-        distance_yards = _yards_from_distance(dist_raw, dist_unit)
+    for idx, race in enumerate(race_nodes, start=1):
+        rnum = safe_int(
+            first_text(
+                race,
+                # common variants
+                "RaceNumber",
+                "RACE_NUMBER",
+                "RaceNum",
+                "RACE_NUM",
+                "Number",
+                "NUMBER",
+                "RaceNo",
+                "RACE_NO",
+            )
+        )
+        if rnum is None:
+            # last resort: use ordinal position in file
+            rnum = idx
 
-        rrow = {
-            "track_code": track,
+        dist = first_text(race, "DistanceDescription", "DISTANCE_DESCRIPTION")
+        dist_yards = yards_from_furlongs_miles(dist)
+
+        surf = surface_code(first_text(race, "Surface", "SURFACE"))
+        cond = first_text(race, "TrackCondition", "TRACK_CONDITION")
+
+        rr: dict[str, Any] = {
+            "track_code": tcode,
             "race_date": rdate,
             "race_number": rnum,
-            "surface": surface,
-            "distance_yards": distance_yards,
-            "track_condition": trk_cond,
+            "surface": surf,
+            "distance_yards": dist_yards,
+            "track_condition": cond,
         }
-        rrow["row_fingerprint"] = fingerprint(rrow)
-        race_rows.append(rrow)
+        rr["row_fingerprint"] = fingerprint(rr)
+        race_rows.append(rr)
 
-        # --- Entries (finishers) ---
-        for e in r.findall("./ENTRY"):
-            prog = first_text(e, "PROGRAM_NUM")  # program number like "1", "1A"
-            horse = first_text(e, "NAME")
-            finish = safe_int(first_text(e, "OFFICIAL_FIN"))
-            odds = safe_float(first_text(e, "DOLLAR_ODDS"))
-            win_pay = safe_float(first_text(e, "WIN_PAYOFF"))
-            pl_pay = safe_float(first_text(e, "PLACE_PAYOFF"))
-            sh_pay = safe_float(first_text(e, "SHOW_PAYOFF"))
+        # Entries/Starters
+        starters_parent = findall(race, "Starters", "STARTERS")
+        starter_nodes: list[etree._Element] = []
+        for sp in starters_parent:
+            starter_nodes.extend(findall(sp, "Starter", "STARTER"))
 
-            # Only emit if we have a program number and a horse name
-            if not prog or not horse:
+        for s in starter_nodes:
+            prog = first_text(
+                s,
+                "ProgramNumber",
+                "PROGRAM_NUMBER",
+                "Program",
+                "PROGRAM",
+                "PostPosition",
+                "POST_POSITION",
+            )
+            if prog:
+                import re
+
+                m = re.match(r"^\s*(\d{1,2})([A-C]?)\s*$", prog.strip())
+                if not m:
+                    continue
+                prog = m.group(0).strip()
+            else:
                 continue
 
-            erow = {
-                "track_code": track,
-                "race_date": rdate,
-                "race_number": rnum,
-                "program_number": prog.strip(),
-                "horse_name": horse.strip(),
+            horse = first_text(s, "Horse", "HORSE", "HorseName", "HORSE_NAME") or ""
+            finish = safe_int(
+                first_text(s, "FinishPosition", "FINISH_POSITION", "Finish", "FINISH")
+            )
+            odds = safe_float(first_text(s, "FinalOdds", "FINAL_ODDS", "Odds", "ODDS"))
+
+            win_pay = safe_float(first_text(s, "WinPayoff", "WIN_PAYOFF", "WIN")) or 0.0
+            place_pay = safe_float(first_text(s, "PlacePayoff", "PLACE_PAYOFF", "PLACE")) or 0.0
+            show_pay = safe_float(first_text(s, "ShowPayoff", "SHOW_PAYOFF", "SHOW")) or 0.0
+
+            er: dict[str, Any] = {
+                "track_code": tcode or "",
+                "race_date": rdate or "",
+                "race_number": rnum or 0,
+                "program_number": prog,
+                "horse_name": horse,
                 "finish_position": finish,
                 "final_odds": odds,
                 "win_payoff": win_pay,
-                "place_payoff": pl_pay,
-                "show_payoff": sh_pay,
+                "place_payoff": place_pay,
+                "show_payoff": show_pay,
             }
-            erow["row_fingerprint"] = fingerprint(erow)
-            entry_rows.append(erow)
+            er["row_fingerprint"] = fingerprint(er)
+            entry_rows.append(er)
 
-        # --- Exotics / payouts ---
-        wagers_parent = r.find("./EXOTIC_WAGERS")
-        if wagers_parent is not None:
-            for w in wagers_parent.findall("./WAGER"):
-                wtype = first_text(w, "WAGER_TYPE")  # e.g., Exacta, Trifecta, Pick 5
-                winners = first_text(w, "WINNERS")  # string like " 3-8-5"
-                pool = safe_float(first_text(w, "POOL_TOTAL"))
-                payoff = safe_float(first_text(w, "PAYOFF"))
-
-                if not wtype:
-                    continue
-
-                prow = {
-                    "track_code": track,
-                    "race_date": rdate,
-                    "race_number": rnum,
-                    "wager_type": wtype.strip(),
-                    "winning_numbers": winners.strip() if winners else None,
-                    "pool": pool,
-                    "payout_amount": payoff,
-                }
-                prow["row_fingerprint"] = fingerprint(prow)
-                payout_rows.append(prow)
-
-        # --- Scratches ---
-        for s in r.findall("./SCRATCH"):
-            horse = first_text(s, "NAME")
-            reason = first_text(s, "REASON")
-            # PROGRAM_NUM often not present in SCRATCH for TCH; keep None if absent
-            prog = first_text(s, "PROGRAM_NUM")
-
-            if not horse:
-                continue
-
-            srow = {
-                "track_code": track,
-                "race_date": rdate,
-                "race_number": rnum,
-                "program_number": prog.strip() if prog else None,
-                "horse_name": horse.strip(),
-                "reason": reason.strip() if reason else None,
-            }
-            srow["row_fingerprint"] = fingerprint(srow)
-            scratch_rows.append(srow)
-
-    return {"race": race_rows, "entry": entry_rows, "payout": payout_rows, "scratch": scratch_rows}
+    return {"race": race_rows, "entry": entry_rows}
 
 
 # -----------------------------
-# Upsert staging tables
+# Dynamic upsert helpers
 # -----------------------------
+def get_table_columns(conn, table: str, schema: str = SCHEMA) -> set[str]:
+    rows = conn.execute(
+        text(
+            """
+            select column_name
+            from information_schema.columns
+            where table_schema = :schema and table_name = :table
+            """
+        ),
+        {"schema": schema, "table": table},
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def build_upsert_sql(
+    table: str, cols: Iterable[str], conflict_cols: Iterable[str], schema: str = SCHEMA
+) -> str:
+    cols = list(cols)
+    conflict_cols = list(conflict_cols)
+    bind_cols = ", ".join(f":{c}" for c in cols)
+    insert_cols = ", ".join(cols)
+    update_cols = [c for c in cols if c not in conflict_cols]
+    update_set = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+    fq = f"{schema}.{table}"
+    sql = f"""
+        insert into {fq}
+        ({insert_cols})
+        values
+        ({bind_cols})
+        on conflict ({", ".join(conflict_cols)})
+        do update set
+          {update_set}
+    """
+    return sql
 
 
 def _upsert_staging(engine, file_id: int, rows: dict[str, list[dict[str, Any]]]) -> None:
     with engine.begin() as conn:
-        if rows["race"]:
-            conn.execute(
-                text(
-                    """
-                    insert into horse_handicapping.stg_chart_race
-                    (source_file_id, track_code, race_date, race_number,
-                     surface, distance_yards, track_condition,
-                     row_fingerprint)
-                    values
-                    (:fid, :track_code, :race_date, :race_number,
-                     :surface, :distance_yards, :track_condition,
-                     :row_fingerprint)
-                    on conflict (source_file_id, track_code, race_date, race_number)
-                    do update set
-                      surface = excluded.surface,
-                      distance_yards = excluded.distance_yards,
-                      track_condition = excluded.track_condition,
-                      row_fingerprint = excluded.row_fingerprint
-                """
-                ),
-                [dict(fid=file_id, **r) for r in rows["race"]],
-            )
+        race_cols_actual = get_table_columns(conn, "stg_chart_race")
+        entry_cols_actual = get_table_columns(conn, "stg_chart_entry")
 
-        if rows["entry"]:
-            conn.execute(
-                text(
-                    """
-                    insert into horse_handicapping.stg_chart_entry
-                    (source_file_id, track_code, race_date, race_number,
-                     program_number, horse_name, finish_position, final_odds,
-                     win_payoff, place_payoff, show_payoff, row_fingerprint)
-                    values
-                    (:fid, :track_code, :race_date, :race_number,
-                     :program_number, :horse_name, :finish_position, :final_odds,
-                     :win_payoff, :place_payoff, :show_payoff, :row_fingerprint)
-                    on conflict (source_file_id, track_code, race_date, race_number, program_number)
-                    do update set
-                      finish_position = excluded.finish_position,
-                      final_odds = excluded.final_odds,
-                      win_payoff = excluded.win_payoff,
-                      place_payoff = excluded.place_payoff,
-                      show_payoff = excluded.show_payoff,
-                      row_fingerprint = excluded.row_fingerprint
-                """
-                ),
-                [dict(fid=file_id, **r) for r in rows["entry"]],
-            )
+        race_wanted = [
+            "source_file_id",
+            "track_code",
+            "race_date",
+            "race_number",
+            "surface",
+            "distance_yards",
+            "track_condition",
+            "row_fingerprint",
+        ]
+        entry_wanted = [
+            "source_file_id",
+            "track_code",
+            "race_date",
+            "race_number",
+            "program_number",
+            "horse_name",
+            "finish_position",
+            "final_odds",
+            "win_payoff",
+            "place_payoff",
+            "show_payoff",
+            "row_fingerprint",
+        ]
 
-        if rows["payout"]:
-            conn.execute(
-                text(
-                    """
-                    insert into horse_handicapping.stg_chart_payout
-                    (source_file_id, track_code, race_date, race_number,
-                     wager_type, winning_numbers, pool, payout_amount, row_fingerprint)
-                    values
-                    (:fid, :track_code, :race_date, :race_number,
-                     :wager_type, :winning_numbers, :pool, :payout_amount, :row_fingerprint)
-                    on conflict (source_file_id, track_code, race_date, race_number, wager_type)
-                    do update set
-                      winning_numbers = excluded.winning_numbers,
-                      pool = excluded.pool,
-                      payout_amount = excluded.payout_amount,
-                      row_fingerprint = excluded.row_fingerprint
-                """
-                ),
-                [dict(fid=file_id, **r) for r in rows["payout"]],
-            )
+        race_pk = [
+            c
+            for c in ("source_file_id", "track_code", "race_date", "race_number")
+            if c in race_cols_actual
+        ]
+        entry_pk = [
+            c
+            for c in ("source_file_id", "track_code", "race_date", "race_number", "program_number")
+            if c in entry_cols_actual
+        ]
 
-        if rows["scratch"]:
-            conn.execute(
-                text(
-                    """
-                    insert into horse_handicapping.stg_chart_scratch
-                    (source_file_id, track_code, race_date, race_number,
-                     program_number, horse_name, reason, row_fingerprint)
-                    values
-                    (:fid, :track_code, :race_date, :race_number,
-                     :program_number, :horse_name, :reason, :row_fingerprint)
-                    on conflict (source_file_id, track_code, race_date, race_number, program_number)
-                    do update set
-                      horse_name = excluded.horse_name,
-                      reason = excluded.reason,
-                      row_fingerprint = excluded.row_fingerprint
-                """
-                ),
-                [dict(fid=file_id, **r) for r in rows["scratch"]],
-            )
+        race_cols = [c for c in race_wanted if c in race_cols_actual]
+        entry_cols = [c for c in entry_wanted if c in entry_cols_actual]
+
+        if rows["race"] and race_cols and race_pk:
+            sql = build_upsert_sql("stg_chart_race", race_cols, race_pk)
+            payload = [{**r, "source_file_id": file_id} for r in rows["race"]]
+            payload = [{k: v for k, v in d.items() if k in race_cols} for d in payload]
+            conn.execute(text(sql), payload)
+
+        if rows["entry"] and entry_cols and entry_pk:
+            sql = build_upsert_sql("stg_chart_entry", entry_cols, entry_pk)
+            payload = [{**r, "source_file_id": file_id} for r in rows["entry"]]
+            payload = [{k: v for k, v in d.items() if k in entry_cols} for d in payload]
+            conn.execute(text(sql), payload)
 
 
 # -----------------------------
 # CLI
 # -----------------------------
+def _defaults_from_filename(p: Path) -> tuple[str | None, str | None]:
+    # kee20231014tch.xml -> track=KEE, date=2023-10-14
+    stem = p.stem
+    if len(stem) >= 11:
+        track = stem[:3].upper()
+        date_part = stem[3:11]
+        if date_part.isdigit():
+            y, m, d = date_part[:4], date_part[4:6], date_part[6:8]
+            return track, f"{y}-{m}-{d}"
+    return None, None
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Parse Equibase Chart (TCH) XML to staging")
-    ap.add_argument("xml_path", type=str, help="Path to TCH XML file")
+    ap.add_argument("xml_path", type=str, help="Path to chart XML file")
     ap.add_argument("--echo", action="store_true", help="Echo SQL (via engine echo)")
     args = ap.parse_args()
 
@@ -298,20 +351,14 @@ def main() -> None:
     if not p.exists():
         raise SystemExit(f"File not found: {p}")
 
-    # Engine
     engine = get_engine(echo=args.echo)
 
-    # Defaults from filename
     d_track, d_date = _defaults_from_filename(p)
-
-    # Parse XML
     doc = etree.parse(str(p))
 
-    # Register file and extract rows
     file_id = register_file(engine, p, d_track, d_date, provider="equibase", file_type="chart")
-    rows = _emit_rows_chart(doc, default_track=d_track, default_date=d_date)
+    rows = emit_rows_chart(doc, default_track=d_track, default_date=d_date)
 
-    # Upsert staging
     _upsert_staging(engine, file_id, rows)
 
 
