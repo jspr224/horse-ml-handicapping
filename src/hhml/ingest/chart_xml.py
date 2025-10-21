@@ -308,7 +308,7 @@ def main() -> None:
     doc = etree.parse(str(p))
 
     # Register file and extract rows
-    file_id = register_file(engine, p, d_track, d_date, provider="equibase", ftype="chart")
+    file_id = register_file(engine, p, d_track, d_date, provider="equibase", file_type="chart")
     rows = _emit_rows_chart(doc, default_track=d_track, default_date=d_date)
 
     # Upsert staging
