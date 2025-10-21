@@ -94,6 +94,49 @@ def surface_code(val: str | None) -> str | None:
     return v[:1] if v else None
 
 
+def text_or_attr_distance(race: etree._Element) -> str | None:
+    """
+    Return a human-readable distance string like '7 Furlongs' or '1 1/16 Miles'
+    from either text nodes or <Distance unit="...">N</Distance> forms.
+    """
+    # common description nodes
+    desc = first_text(
+        race,
+        "DistanceDescription",
+        "DISTANCE_DESCRIPTION",
+        "DistanceDesc",
+        "DIST_DESC",
+    )
+    if desc:
+        return desc
+
+    # sometimes it's just 'Distance'
+    raw = first_text(race, "Distance", "DISTANCE")
+    if raw:
+        # could already be like "7 Furlongs"
+        if any(w in raw.lower() for w in ("furlong", "mile")):
+            return raw
+        # or numeric value with a sibling/attr unit
+        for el in race.xpath(".//*[local-name()='Distance']"):
+            unit = (el.get("unit") or el.get("UNIT") or "").strip()
+            if str(el.text or "").strip() == raw.strip() and unit:
+                unit_norm = unit.lower()
+                if unit_norm.startswith("fur"):
+                    return f"{raw} Furlongs"
+                if unit_norm.startswith("mil"):
+                    try:
+                        v = float(raw)
+                        if abs(v - int(v)) < 1e-9:
+                            return f"{int(v)} Mile" if int(v) == 1 else f"{int(v)} Miles"
+                    except Exception:
+                        pass
+                    return f"{raw} Miles"
+        # last resort: assume furlongs
+        return f"{raw} Furlongs"
+
+    return None
+
+
 # -----------------------------
 # Row containers
 # -----------------------------
@@ -159,11 +202,14 @@ def emit_rows_chart(
             # last resort: use ordinal position in file
             rnum = idx
 
-        dist = first_text(race, "DistanceDescription", "DISTANCE_DESCRIPTION")
+        # ---- distance / condition ----
+        dist = text_or_attr_distance(race)
         dist_yards = yards_from_furlongs_miles(dist)
 
+        cond = first_text(race, "TrackCondition", "TRACK_CONDITION") or first_text(
+            race, "TrackConditionCode", "TRACK_CONDITION_CODE"
+        )
         surf = surface_code(first_text(race, "Surface", "SURFACE"))
-        cond = first_text(race, "TrackCondition", "TRACK_CONDITION")
 
         rr: dict[str, Any] = {
             "track_code": tcode,
@@ -175,6 +221,71 @@ def emit_rows_chart(
         }
         rr["row_fingerprint"] = fingerprint(rr)
         race_rows.append(rr)
+
+        # ---- entries / starters ----
+        # Parents that might contain the list of starters/entries
+        parent_candidates = findall(
+            race,
+            "Starters",
+            "STARTERS",
+            "Entries",
+            "ENTRIES",
+            "Results",
+            "RESULTS",
+            "HorseList",
+            "HORSELIST",
+        )
+        starter_nodes: list[etree._Element] = []
+        for parent in parent_candidates:
+            starter_nodes.extend(
+                findall(parent, "Starter", "STARTER", "Entry", "ENTRY", "Horse", "HORSE")
+            )
+
+        for s in starter_nodes:
+            prog = first_text(
+                s,
+                "ProgramNumber",
+                "PROGRAM_NUMBER",
+                "Program",
+                "PROGRAM",
+                "PostPosition",
+                "POST_POSITION",
+                "PP",
+            )
+            if prog:
+                import re
+
+                m = re.match(r"^\s*(\d{1,2})([A-C]?)\s*$", prog.strip())
+                if not m:
+                    continue
+                prog = m.group(0).strip()
+            else:
+                continue
+
+            horse = first_text(s, "Horse", "HORSE", "HorseName", "HORSE_NAME", "Name", "NAME") or ""
+            finish = safe_int(
+                first_text(s, "FinishPosition", "FINISH_POSITION", "Finish", "FINISH", "Pos", "POS")
+            )
+            odds = safe_float(first_text(s, "FinalOdds", "FINAL_ODDS", "Odds", "ODDS"))
+
+            win_pay = safe_float(first_text(s, "WinPayoff", "WIN_PAYOFF", "WIN"))
+            place_pay = safe_float(first_text(s, "PlacePayoff", "PLACE_PAYOFF", "PLACE"))
+            show_pay = safe_float(first_text(s, "ShowPayoff", "SHOW_PAYOFF", "SHOW"))
+
+            er: dict[str, Any] = {
+                "track_code": tcode or "",
+                "race_date": rdate or "",
+                "race_number": rnum or 0,
+                "program_number": prog,
+                "horse_name": horse,
+                "finish_position": finish,
+                "final_odds": odds,
+                "win_payoff": win_pay,
+                "place_payoff": place_pay,
+                "show_payoff": show_pay,
+            }
+            er["row_fingerprint"] = fingerprint(er)
+            entry_rows.append(er)
 
         # Entries/Starters
         starters_parent = findall(race, "Starters", "STARTERS")
