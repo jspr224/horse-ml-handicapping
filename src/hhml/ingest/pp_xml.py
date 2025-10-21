@@ -123,6 +123,40 @@ def register_file(engine, path: Path, track_code: str | None, race_date: str | N
 
 
 # -----------------------------
+# XML helpers (namespace-agnostic)
+# -----------------------------
+
+
+def _iter_local(node: etree._Element, *names: str) -> list[etree._Element]:
+    """Return descendants whose local-name() matches any provided name."""
+    out: list[etree._Element] = []
+    for nm in names:
+        out.extend(node.xpath(f".//*[local-name()='{nm}']"))
+    return out
+
+
+def _first_text_local(node: etree._Element, *names: str) -> str | None:
+    """First non-empty text for any descendant with local-name in names.
+    Also checks attributes of those nodes for values if text is empty.
+    """
+    for el in _iter_local(node, *names):
+        if el.text and str(el.text).strip():
+            return str(el.text).strip()
+        # look at attributes like <Entry Program="1A"/>
+        for k, v in el.attrib.items():
+            if str(v).strip():
+                return str(v).strip()
+    return None
+
+
+def _first_attr_local(node: etree._Element, attrs: tuple[str, ...]) -> str | None:
+    for k, v in node.attrib.items():
+        if k in attrs and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+# -----------------------------
 # XML extraction
 # -----------------------------
 
@@ -134,51 +168,38 @@ def _emit_rows_pp(
 ) -> dict[str, list[dict[str, Any]]]:
     root = doc.getroot()
 
-    def first_text(node, *paths: str) -> str | None:
-        for p in paths:
-            v = node.findtext(p)
-            if v is not None and str(v).strip() != "":
-                return str(v).strip()
-        return None
-
-    track = (first_text(root, ".//Track/Code", ".//TRACK/CODE") or default_track or "UNK").strip()
-    # Prefer filename date if provided, else fall back to XML
-    rdate = (default_date or first_text(root, ".//RaceDate", ".//RACE_DATE") or "").strip()
+    # Track & date (prefer filename-derived)
+    track = (
+        _first_text_local(root, "Code")
+        or _first_text_local(root, "Track")
+        or default_track
+        or "UNK"
+    ).strip()
+    rdate = (default_date or _first_text_local(root, "RaceDate") or "").strip()
 
     race_rows: list[dict[str, Any]] = []
     entry_rows: list[dict[str, Any]] = []
     work_rows: list[dict[str, Any]] = []
 
-    # ---- Races ----
-    for race in root.findall(".//Race") + root.findall(".//RACE"):
-
-        def rt(node, *paths):
-            for pth in paths:
-                v = node.findtext(pth)
-                if v is not None and str(v).strip() != "":
-                    return str(v).strip()
-            return None
-
-        # race number with robust fallbacks (tags and attributes)
-        rnum_txt = (
-            rt(race, "Number", "NUMBER", "RaceNumber", "RACE_NUMBER")
-            or race.get("Number")
-            or race.get("NUMBER")
-            or race.get("num")
+    # ---- Races (ns-agnostic) ----
+    for race in _iter_local(root, "Race"):
+        # race number via tag or attribute
+        rnum_txt = _first_text_local(race, "Number", "RaceNumber") or _first_attr_local(
+            race, ("Number", "NUMBER", "num")
         )
         rnum = safe_int(rnum_txt)
         if rnum is None:
             # skip malformed races to satisfy NOT NULL
             continue
 
-        surface = rt(race, "Surface", "SURFACE")
-        distance_yd = safe_int(rt(race, "DistanceYards", "DISTANCE_YARDS", "DistanceYd"))
-        condition = rt(race, "TrackCondition", "TRACK_CONDITION", "Condition")
-        age_restr = rt(race, "AgeRestriction", "AGE_RESTRICTION")
-        sex_restr = rt(race, "SexRestriction", "SEX_RESTRICTION")
-        purse = safe_int(rt(race, "Purse", "PURSE"))
-        wager_text = rt(race, "WagerText", "WAGER_TEXT")
-        prog_sel = rt(race, "ProgramSelections", "PROGRAM_SELECTIONS")
+        surface = _first_text_local(race, "Surface")
+        distance_yd = safe_int(_first_text_local(race, "DistanceYards", "DistanceYd"))
+        condition = _first_text_local(race, "TrackCondition", "Condition")
+        age_restr = _first_text_local(race, "AgeRestriction")
+        sex_restr = _first_text_local(race, "SexRestriction")
+        purse = safe_int(_first_text_local(race, "Purse"))
+        wager_text = _first_text_local(race, "WagerText")
+        prog_sel = _first_text_local(race, "ProgramSelections")
 
         rrow = {
             "track_code": track,
@@ -197,112 +218,52 @@ def _emit_rows_pp(
         rrow["row_fingerprint"] = fingerprint(rrow)
         race_rows.append(rrow)
 
-        # ---- Entries ----
-        entry_nodes = []
-        for tag in ("Starter", "STARTER", "Entry", "ENTRY", "Horse", "HORSE", "Runner", "RUNNER"):
-            entry_nodes.extend(race.findall(f".//{tag}"))
+        # ---- Entries (Starter/Entry/Horse/Runner) ----
+        entry_nodes: list[etree._Element] = []
+        entry_nodes.extend(_iter_local(race, "Starter", "Entry", "Horse", "Runner"))
 
-        def et(node, *paths):
-            # child text
-            for p in paths:
-                v = node.findtext(p)
-                if v is not None and str(v).strip() != "":
-                    return str(v).strip()
-            # attribute
-            for p in paths:
-                if p in node.attrib and str(node.attrib[p]).strip() != "":
-                    return node.attrib[p].strip()
+        def et(node: etree._Element, *names: str) -> str | None:
+            # prefer child/descendant text; if empty, check attributes
+            val = _first_text_local(node, *names)
+            if val is not None and str(val).strip():
+                return str(val).strip()
             return None
 
-        def get_program_number(n) -> str | None:
-            # 1) direct child elements
-            val = first_text(
+        def get_program_number(n: etree._Element) -> str | None:
+            # 1) direct descendant text
+            val = _first_text_local(
                 n,
                 "Program",
-                "PROGRAM",
                 "Prog",
-                "PROG",
                 "PostPosition",
-                "POST_POSITION",
-                "POST",
                 "PP",
                 "Number",
-                "NUMBER",
                 "ProgNum",
-                "PROGNUM",
                 "ProgramNumber",
-                "PROGRAM_NUMBER",
                 "SaddleCloth",
-                "SADDLE_CLOTH",
                 "EntryNumber",
-                "ENTRY_NUMBER",
             )
-
             # 2) attributes on the entry node
             if not val:
-                for attr in (
-                    "program",
-                    "PROGRAM",
-                    "prog",
-                    "PROG",
-                    "pp",
-                    "PP",
-                    "post",
-                    "POST",
-                    "number",
-                    "NUMBER",
-                    "prognum",
-                    "PROGNUM",
-                    "program_number",
-                    "PROGRAM_NUMBER",
-                    "saddlecloth",
-                    "SADDLE_CLOTH",
-                    "entry_number",
-                    "ENTRY_NUMBER",
-                ):
-                    v = n.get(attr)
-                    if v and v.strip():
-                        val = v.strip()
-                        break
-
-            # 3) last resort: sweep descendants for those names
-            if not val:
-                try:
-                    names = (
-                        "Program",
+                val = _first_attr_local(
+                    n,
+                    (
+                        "program",
                         "PROGRAM",
-                        "Prog",
-                        "PROG",
-                        "PostPosition",
-                        "POST_POSITION",
-                        "POST",
-                        "PP",
-                        "Number",
-                        "NUMBER",
-                        "ProgramNumber",
-                        "PROGRAM_NUMBER",
-                        "SaddleCloth",
-                        "SADDLE_CLOTH",
-                        "EntryNumber",
-                        "ENTRY_NUMBER",
-                    )
-                    for name in names:
-                        hits = n.xpath(f".//*[local-name()='{name}']/text()")
-                        for h in hits:
-                            s = str(h).strip()
-                            if s:
-                                val = s
-                                break
-                        if val:
-                            break
-                except Exception:
-                    pass
-
+                        "prog",
+                        "pp",
+                        "post",
+                        "number",
+                        "prognum",
+                        "program_number",
+                        "saddlecloth",
+                        "entry_number",
+                    ),
+                )
+            # 3) normalize to [1-99][A-C]?
             if not val:
                 return None
-
-            # 4) normalize: 1–2 digits + optional A/B/C; strip leading zeros (e.g., "01A" -> "1A")
-            m = re.match(r"^\s*0*(\d{1,2})([A-C]?)\s*$", val)
+            m = re.match(r"^\s*0*(\d{1,2})([A-C]?)\s*$", str(val))
             if not m:
                 return None
             return f"{m.group(1)}{m.group(2)}"
@@ -310,27 +271,27 @@ def _emit_rows_pp(
         for e in entry_nodes:
             prog = get_program_number(e)
             if not prog:
-                # Strict behavior: if we can't confidently extract a program number, skip this entry
+                # Strict: skip if no reliable program number
                 continue
 
-            horse = et(e, "HorseName", "HORSE_NAME", "Name", "NAME")
-            sire = et(e, "Sire", "SIRE")
-            dam = et(e, "Dam", "DAM")
-            trainer = et(e, "TrainerName", "TRAINER_NAME", "Trainer", "TRAINER")
-            jockey = et(e, "JockeyName", "JOCKEY_NAME", "Jockey", "JOCKEY")
+            horse = et(e, "HorseName", "Name")
+            sire = et(e, "Sire")
+            dam = et(e, "Dam")
+            trainer = et(e, "TrainerName", "Trainer")
+            jockey = et(e, "JockeyName", "Jockey")
 
-            med = (et(e, "Medication", "MEDICATION") or "").upper()
-            eqp = (et(e, "Equipment", "EQUIPMENT") or "").upper()
+            med = (et(e, "Medication") or "").upper()
+            eqp = (et(e, "Equipment") or "").upper()
             lasix = "LASIX" in med if med else None
             blinkers = "BLINK" in eqp if eqp else None
 
-            ml_odds = et(e, "MorningLine", "MORNING_LINE", "ML")
-            spd = safe_int(et(e, "SpeedFigure", "SPEED_FIGURE", "Speed", "SPEED"))
-            pf1 = safe_int(et(e, "PaceFigure1", "PACE_FIGURE1", "Pace1", "PACE1"))
-            pf2 = safe_int(et(e, "PaceFigure2", "PACE_FIGURE2", "Pace2", "PACE2"))
-            pf3 = safe_int(et(e, "PaceFigure3", "PACE_FIGURE3", "Pace3", "PACE3"))
-            cr = safe_int(et(e, "ClassRating", "CLASS_RATING", "Class", "CLASS"))
-            cmt = et(e, "ShortComment", "LONG_COMMENT", "Comment", "COMMENT")
+            ml_odds = et(e, "MorningLine", "ML")
+            spd = safe_int(et(e, "SpeedFigure", "Speed"))
+            pf1 = safe_int(et(e, "PaceFigure1", "Pace1"))
+            pf2 = safe_int(et(e, "PaceFigure2", "Pace2"))
+            pf3 = safe_int(et(e, "PaceFigure3", "Pace3"))
+            cr = safe_int(et(e, "ClassRating", "Class"))
+            cmt = et(e, "ShortComment", "LongComment", "Comment")
 
             erow = {
                 "track_code": track,
@@ -356,26 +317,22 @@ def _emit_rows_pp(
             entry_rows.append(erow)
 
     # ---- Workouts (often outside Race) ----
-    for w in root.findall(".//Workout") + root.findall(".//WORKOUT"):
+    for w in _iter_local(root, "Workout"):
 
-        def wt(node, *paths):
-            for p in paths:
-                v = node.findtext(p)
-                if v is not None and str(v).strip() != "":
-                    return str(v).strip()
-            return None
+        def wt(node: etree._Element, *names: str) -> str | None:
+            return _first_text_local(node, *names)
 
         wrow = {
-            "horse_name": wt(w, "HorseName", "HORSE_NAME"),
-            "work_date": wt(w, "Date", "DATE"),
-            "track_code": wt(w, "Track", "TRACK") or track,
-            "distance_furlongs": safe_float(wt(w, "DistanceFurlongs", "DIST_FURLONGS")),
-            "surface": wt(w, "Surface", "SURFACE"),
-            "course_type": wt(w, "CourseType", "COURSE_TYPE"),
-            "rank_in_set": safe_int(wt(w, "Rank", "RANK")),
-            "set_size": safe_int(wt(w, "SetSize", "SET_SIZE")),
-            "time_raw": wt(w, "Time", "TIME"),
-            "bullet_flag": (wt(w, "Bullet", "BULLET") or "").upper() in ("Y", "TRUE", "1"),
+            "horse_name": wt(w, "HorseName"),
+            "work_date": wt(w, "Date"),
+            "track_code": wt(w, "Track") or track,
+            "distance_furlongs": safe_float(wt(w, "DistanceFurlongs", "DistFurlongs")),
+            "surface": wt(w, "Surface"),
+            "course_type": wt(w, "CourseType"),
+            "rank_in_set": safe_int(wt(w, "Rank")),
+            "set_size": safe_int(wt(w, "SetSize")),
+            "time_raw": wt(w, "Time"),
+            "bullet_flag": (wt(w, "Bullet") or "").upper() in ("Y", "TRUE", "1"),
         }
 
         if not wrow["horse_name"]:
@@ -493,7 +450,6 @@ def main() -> None:
     if not p.exists():
         raise SystemExit(f"File not found: {p}")
 
-    # Engine (respect global echo if flag is set by temporarily creating)
     engine = get_engine(echo=args.echo)
 
     # Filename defaults
