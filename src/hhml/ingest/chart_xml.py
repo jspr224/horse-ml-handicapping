@@ -205,10 +205,16 @@ def emit_rows_chart(
         # ---- distance / condition ----
         dist = text_or_attr_distance(race)
         dist_yards = yards_from_furlongs_miles(dist)
+        # Fix over-scaled numeric-only distances like '154000'
+        if dist_yards and dist_yards > 10000:
+            dist_yards = dist_yards / 100
 
-        cond = first_text(race, "TrackCondition", "TRACK_CONDITION") or first_text(
-            race, "TrackConditionCode", "TRACK_CONDITION_CODE"
+        cond = (
+            first_text(race, "TrackCondition", "TRACK_CONDITION")
+            or first_text(race, "TrackConditionCode", "TRACK_CONDITION_CODE")
+            or first_text(race, "TrackConditionDesc", "TRACK_CONDITION_DESC")
         )
+
         surf = surface_code(first_text(race, "Surface", "SURFACE"))
 
         rr: dict[str, Any] = {
