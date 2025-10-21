@@ -215,12 +215,16 @@ def _emit_rows_pp(
             return None
 
         def get_program_number(n) -> str | None:
-            val = et(
+            # 1) direct child elements
+            val = first_text(
                 n,
                 "Program",
                 "PROGRAM",
+                "Prog",
+                "PROG",
                 "PostPosition",
                 "POST_POSITION",
+                "POST",
                 "PP",
                 "Number",
                 "NUMBER",
@@ -233,59 +237,81 @@ def _emit_rows_pp(
                 "EntryNumber",
                 "ENTRY_NUMBER",
             )
-            if val:
-                return val
-            # descendant sweep for common names
-            try:
-                for name in (
-                    "Program",
+
+            # 2) attributes on the entry node
+            if not val:
+                for attr in (
+                    "program",
                     "PROGRAM",
-                    "PostPosition",
-                    "POST_POSITION",
+                    "prog",
+                    "PROG",
+                    "pp",
                     "PP",
-                    "Number",
+                    "post",
+                    "POST",
+                    "number",
                     "NUMBER",
+                    "prognum",
+                    "PROGNUM",
+                    "program_number",
+                    "PROGRAM_NUMBER",
+                    "saddlecloth",
+                    "SADDLE_CLOTH",
+                    "entry_number",
+                    "ENTRY_NUMBER",
                 ):
-                    hits = n.xpath(f".//*[local-name()='{name}']/text()")
-                    for h in hits:
-                        if str(h).strip():
-                            return str(h).strip()
-            except Exception:
-                pass
-            return None
-
-        for e in entry_nodes:
-            # --- Program number (robust) ---
-            # Try common node names first
-            prog = first_text(
-                e,
-                "Program",
-                "PROGRAM",
-                "Prog",
-                "PROG",
-                "Saddle",
-                "SADDLE",
-                "PP",
-                "POST_POSITION",
-                "PostPosition",
-                "POST",
-                "ENTRY_NUMBER",
-            )
-
-            # Some feeds put it on the <Entry>/<Starter> node as an attribute
-            if not prog:
-                for attr in ("program", "PROGRAM", "pp", "PP", "post", "POST"):
-                    v = e.get(attr)
+                    v = n.get(attr)
                     if v and v.strip():
-                        prog = v.strip()
+                        val = v.strip()
                         break
 
-            # Normalize: allow 1–2 digits plus optional A/B/C suffix (e.g., "1", "1A", "12B")
-            if prog:
-                import re
+            # 3) last resort: sweep descendants for those names
+            if not val:
+                try:
+                    names = (
+                        "Program",
+                        "PROGRAM",
+                        "Prog",
+                        "PROG",
+                        "PostPosition",
+                        "POST_POSITION",
+                        "POST",
+                        "PP",
+                        "Number",
+                        "NUMBER",
+                        "ProgramNumber",
+                        "PROGRAM_NUMBER",
+                        "SaddleCloth",
+                        "SADDLE_CLOTH",
+                        "EntryNumber",
+                        "ENTRY_NUMBER",
+                    )
+                    for name in names:
+                        hits = n.xpath(f".//*[local-name()='{name}']/text()")
+                        for h in hits:
+                            s = str(h).strip()
+                            if s:
+                                val = s
+                                break
+                        if val:
+                            break
+                except Exception:
+                    pass
 
-                m = re.match(r"^\s*(\d{1,2})([A-C]?)\s*$", prog)
-                prog = m.group(0).strip() if m else None
+            if not val:
+                return None
+
+            # 4) normalize: 1–2 digits + optional A/B/C; strip leading zeros (e.g., "01A" -> "1A")
+            m = re.match(r"^\s*0*(\d{1,2})([A-C]?)\s*$", val)
+            if not m:
+                return None
+            return f"{m.group(1)}{m.group(2)}"
+
+        for e in entry_nodes:
+            prog = get_program_number(e)
+            if not prog:
+                # Strict behavior: if we can't confidently extract a program number, skip this entry
+                continue
 
             horse = et(e, "HorseName", "HORSE_NAME", "Name", "NAME")
             sire = et(e, "Sire", "SIRE")
