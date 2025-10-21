@@ -229,12 +229,29 @@ def _emit_rows_pp(
                 return str(val).strip()
             return None
 
-        def get_program_number(n: etree._Element) -> str | None:
-            # 1) direct descendant text
-            val = _first_text_local(
-                n,
+        def get_program_number(n) -> str | None:
+            """
+            Return a normalized program number like '1', '10', '1A' (A-C allowed).
+            Searches (namespace-agnostic) for common tag names first, then attributes,
+            on the node itself and any descendants.
+            """
+            import re
+
+            def _norm(val: str) -> str | None:
+                if val is None:
+                    return None
+                s = str(val).strip()
+                m = re.match(r"^(\d{1,2})([A-C])?$", s, flags=re.IGNORECASE)
+                if not m:
+                    return None
+                # Uppercase the suffix if present
+                base = m.group(1)
+                suf = (m.group(2) or "").upper()
+                return f"{base}{suf}"
+
+            # 1) Text from common child tags (on n)
+            tag_names = (
                 "Program",
-                "Prog",
                 "PostPosition",
                 "PP",
                 "Number",
@@ -243,30 +260,59 @@ def _emit_rows_pp(
                 "SaddleCloth",
                 "EntryNumber",
             )
-            # 2) attributes on the entry node
-            if not val:
-                val = _first_attr_local(
-                    n,
-                    (
-                        "program",
-                        "PROGRAM",
-                        "prog",
-                        "pp",
-                        "post",
-                        "number",
-                        "prognum",
-                        "program_number",
-                        "saddlecloth",
-                        "entry_number",
-                    ),
-                )
-            # 3) normalize to [1-99][A-C]?
-            if not val:
-                return None
-            m = re.match(r"^\s*0*(\d{1,2})([A-C]?)\s*$", str(val))
-            if not m:
-                return None
-            return f"{m.group(1)}{m.group(2)}"
+            for name in tag_names:
+                hits = n.xpath(f"./*[local-name()='{name}']/text()")
+                for h in hits:
+                    v = _norm(h)
+                    if v:
+                        return v
+
+            # 2) Attributes on n
+            attr_names = (
+                "program",
+                "Program",
+                "PROGRAM",
+                "post",
+                "POST",
+                "pp",
+                "PP",
+                "number",
+                "Number",
+                "NUMBER",
+                "prognum",
+                "ProgNum",
+                "PROGRAM_NUMBER",
+                "ProgramNumber",
+                "saddle",
+                "SaddleCloth",
+                "ENTRY_NUMBER",
+                "EntryNumber",
+            )
+            for a in attr_names:
+                if a in n.attrib:
+                    v = _norm(n.attrib[a])
+                    if v:
+                        return v
+
+            # 3) Any descendant text under the common names
+            for name in tag_names:
+                hits = n.xpath(f".//*[local-name()='{name}']/text()")
+                for h in hits:
+                    v = _norm(h)
+                    if v:
+                        return v
+
+            # 4) Any descendant attributes with the common names
+            #    We need to iterate all descendant elements and inspect their attrib maps.
+            for el in n.xpath(".//*"):
+                for a, raw in el.attrib.items():
+                    # Compare attribute name without namespace/case sensitivity
+                    if a.split(":")[-1] in attr_names:
+                        v = _norm(raw)
+                        if v:
+                            return v
+
+            return None
 
         for e in entry_nodes:
             prog = get_program_number(e)
