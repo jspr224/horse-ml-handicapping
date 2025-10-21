@@ -1,8 +1,4 @@
-"""
-chart_xml.py — Parse Equibase-style race result chart XML files
-and upsert data into staging tables in the horse_handicapping schema.
-"""
-
+# src/hhml/ingest/chart_xml.py
 from __future__ import annotations
 
 import argparse
@@ -14,136 +10,185 @@ from sqlalchemy import text
 
 from hhml.db.connect import get_engine
 from hhml.db.files import register_file
-from hhml.utils import fingerprint, safe_float, safe_int
+from hhml.utils import fingerprint, first_text, safe_float, safe_int
 
-# -------------------------------------------------
-# Helper
-# -------------------------------------------------
-
-
-def first_text(node, *paths: str) -> str | None:
-    """Return first non-empty text from a set of possible tag paths."""
-    for p in paths:
-        v = node.findtext(p)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return None
+# -----------------------------
+# Helpers
+# -----------------------------
 
 
-# -------------------------------------------------
-# Core extractor
-# -------------------------------------------------
+def _defaults_from_filename(p: Path) -> tuple[str | None, str | None]:
+    """
+    Infer (track_code, race_date) from filenames like:
+      kee20231014tch.xml  -> (KEE, 2023-10-14)
+      KEE20231014TCH.XML  -> (KEE, 2023-10-14)
+    If pattern doesn't match, return (None, None).
+    """
+    stem = p.name
+    try:
+        s = stem.lower()
+        # expect: <track:3 letters><yyyymmdd>tch
+        # find the date block:
+        import re
+
+        m = re.search(r"([a-z]{3})?(\d{8})tch", s)
+        if not m:
+            return None, None
+        track = (m.group(1) or "").upper() if m.group(1) else None
+        ymd = m.group(2)
+        rdate = f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
+        return track, rdate
+    except Exception:
+        return None, None
+
+
+def _yards_from_distance(dist_raw: str | None, dist_unit: str | None) -> int | None:
+    """
+    Equibase Chart XML encodes DISTANCE with a companion DIST_UNIT.
+    In your sample, DIST_UNIT is 'F' (furlongs) and DISTANCE is like 650 = 6.5f.
+    Convert to yards:
+      Furlong -> 220 yards
+      Mile    -> 1760 yards
+      Yard    -> 1 yard
+    Unknown -> None
+    """
+    d = safe_float(dist_raw)
+    if d is None:
+        return None
+    unit = (dist_unit or "").strip().upper()
+    # In TCH files, distance is coded in hundredths of a unit (e.g., 650 -> 6.50 furlongs)
+    val_units = d / 100.0
+
+    if unit == "F":  # furlongs
+        yards = val_units * 220.0
+    elif unit == "M":  # miles
+        yards = val_units * 1760.0
+    elif unit == "Y":  # yards
+        yards = val_units  # already yards
+    else:
+        return None
+
+    return int(round(yards))
 
 
 def _emit_rows_chart(
-    doc: etree._ElementTree, default_track: str, default_date: str
+    doc: etree._ElementTree, default_track: str | None, default_date: str | None
 ) -> dict[str, list[dict[str, Any]]]:
+    """
+    Parse Equibase TCH (charts) XML into staging row dicts.
+    Produces keys: race, entry, payout, scratch
+    """
     root = doc.getroot()
 
-    track_code = first_text(root, ".//Track/Code", ".//TRACK/CODE") or default_track
-    rdate = first_text(root, ".//RaceDate", ".//RACE_DATE") or default_date
+    race_rows: list[dict[str, Any]] = []
+    entry_rows: list[dict[str, Any]] = []
+    payout_rows: list[dict[str, Any]] = []
+    scratch_rows: list[dict[str, Any]] = []
 
-    race_rows, entry_rows, payout_rows, scratch_rows = [], [], [], []
+    # Track/date from filename (TCH files usually lack a single header code)
+    track = default_track
+    rdate = default_date
 
-    # Iterate races (case-insensitive)
-    for race in root.findall(".//Race") + root.findall(".//RACE"):
-        rnum = safe_int(first_text(race, "RaceNumber", "RACENUMBER", "Number", "NUMBER"))
-        dist = safe_int(first_text(race, "DistanceYards", "DISTANCE_YARDS", "Distance", "DISTANCE"))
-        surf = first_text(race, "Surface", "SURFACE")
-        cond = first_text(race, "TrackCondition", "TRACK_CONDITION", "Condition", "CONDITION")
-        # purse = safe_float(first_text(race, "Purse", "PURSE"))
-        wtime = first_text(race, "WinningTime", "WINNING_TIME", "FinalTime", "FINAL_TIME")
+    # Iterate races
+    for r in root.findall(".//RACE"):
+        rnum = safe_int(r.get("NUMBER")) or safe_int(first_text(r, "RACE_NUMBER"))
+        surface = first_text(r, "SURFACE")  # e.g., 'D', 'T'
+        trk_cond = first_text(r, "TRK_COND")  # e.g., 'FT', 'GD', ...
+        dist_raw = first_text(r, "DISTANCE")
+        dist_unit = first_text(r, "DIST_UNIT")
+        distance_yards = _yards_from_distance(dist_raw, dist_unit)
 
-        rr = {
-            "track_code": track_code,
+        rrow = {
+            "track_code": track,
             "race_date": rdate,
             "race_number": rnum,
-            "surface": surf,
-            "distance_yards": dist,
-            "track_condition": cond,
-            # "purse": purse,
-            "winning_time": wtime,
+            "surface": surface,
+            "distance_yards": distance_yards,
+            "track_condition": trk_cond,
         }
-        rr["row_fingerprint"] = fingerprint(rr)
-        race_rows.append(rr)
+        rrow["row_fingerprint"] = fingerprint(rrow)
+        race_rows.append(rrow)
 
-        # Entries (results)
-        for e in race.findall(".//Starter") + race.findall(".//STARTER"):
-            prog = first_text(
-                e, "Program", "PROGRAM", "PostPosition", "POST_POSITION", "Number", "NUMBER"
-            )
-            horse = first_text(e, "HorseName", "HORSE_NAME")
-            finish_pos = safe_int(
-                first_text(e, "FinishPosition", "FINISH_POSITION", "Finish", "FINISH")
-            )
-            final_odds = first_text(e, "Odds", "ODDS", "FinalOdds", "FINAL_ODDS")
+        # --- Entries (finishers) ---
+        for e in r.findall("./ENTRY"):
+            prog = first_text(e, "PROGRAM_NUM")  # program number like "1", "1A"
+            horse = first_text(e, "NAME")
+            finish = safe_int(first_text(e, "OFFICIAL_FIN"))
+            odds = safe_float(first_text(e, "DOLLAR_ODDS"))
+            win_pay = safe_float(first_text(e, "WIN_PAYOFF"))
+            pl_pay = safe_float(first_text(e, "PLACE_PAYOFF"))
+            sh_pay = safe_float(first_text(e, "SHOW_PAYOFF"))
 
-            win_pay = safe_float(first_text(e, "WinPayoff", "WIN_PAYOFF"))
-            plc_pay = safe_float(first_text(e, "PlacePayoff", "PLACE_PAYOFF"))
-            shw_pay = safe_float(first_text(e, "ShowPayoff", "SHOW_PAYOFF"))
+            # Only emit if we have a program number and a horse name
+            if not prog or not horse:
+                continue
 
-            er = {
-                "track_code": track_code,
+            erow = {
+                "track_code": track,
                 "race_date": rdate,
                 "race_number": rnum,
-                "program_number": prog,
-                "horse_name": horse,
-                "finish_position": finish_pos,
-                "final_odds": final_odds,
+                "program_number": prog.strip(),
+                "horse_name": horse.strip(),
+                "finish_position": finish,
+                "final_odds": odds,
                 "win_payoff": win_pay,
-                "place_payoff": plc_pay,
-                "show_payoff": shw_pay,
+                "place_payoff": pl_pay,
+                "show_payoff": sh_pay,
             }
-            er["row_fingerprint"] = fingerprint(er)
-            entry_rows.append(er)
+            erow["row_fingerprint"] = fingerprint(erow)
+            entry_rows.append(erow)
 
-        # Exotic payouts (optional)
-        for p in race.findall(".//Payout") + race.findall(".//PAYOUT"):
-            wager_type = first_text(p, "WagerType", "WAGER_TYPE", "Type", "TYPE")
-            winning_nums = first_text(p, "WinningNumbers", "WINNING_NUMBERS")
-            pool = safe_float(first_text(p, "Pool", "POOL"))
-            payout = safe_float(first_text(p, "Payout", "PAYOUT"))
+        # --- Exotics / payouts ---
+        wagers_parent = r.find("./EXOTIC_WAGERS")
+        if wagers_parent is not None:
+            for w in wagers_parent.findall("./WAGER"):
+                wtype = first_text(w, "WAGER_TYPE")  # e.g., Exacta, Trifecta, Pick 5
+                winners = first_text(w, "WINNERS")  # string like " 3-8-5"
+                pool = safe_float(first_text(w, "POOL_TOTAL"))
+                payoff = safe_float(first_text(w, "PAYOFF"))
 
-            pr = {
-                "track_code": track_code,
+                if not wtype:
+                    continue
+
+                prow = {
+                    "track_code": track,
+                    "race_date": rdate,
+                    "race_number": rnum,
+                    "wager_type": wtype.strip(),
+                    "winning_numbers": winners.strip() if winners else None,
+                    "pool": pool,
+                    "payout_amount": payoff,
+                }
+                prow["row_fingerprint"] = fingerprint(prow)
+                payout_rows.append(prow)
+
+        # --- Scratches ---
+        for s in r.findall("./SCRATCH"):
+            horse = first_text(s, "NAME")
+            reason = first_text(s, "REASON")
+            # PROGRAM_NUM often not present in SCRATCH for TCH; keep None if absent
+            prog = first_text(s, "PROGRAM_NUM")
+
+            if not horse:
+                continue
+
+            srow = {
+                "track_code": track,
                 "race_date": rdate,
                 "race_number": rnum,
-                "wager_type": wager_type,
-                "winning_numbers": winning_nums,
-                "pool": pool,
-                "payout_amount": payout,
+                "program_number": prog.strip() if prog else None,
+                "horse_name": horse.strip(),
+                "reason": reason.strip() if reason else None,
             }
-            pr["row_fingerprint"] = fingerprint(pr)
-            payout_rows.append(pr)
+            srow["row_fingerprint"] = fingerprint(srow)
+            scratch_rows.append(srow)
 
-        # Scratches
-        for s in race.findall(".//Scratch") + race.findall(".//SCRATCH"):
-            prog = first_text(s, "Program", "PROGRAM")
-            horse = first_text(s, "HorseName", "HORSE_NAME")
-            reason = first_text(s, "Reason", "REASON")
-
-            sr = {
-                "track_code": track_code,
-                "race_date": rdate,
-                "race_number": rnum,
-                "program_number": prog,
-                "horse_name": horse,
-                "reason": reason,
-            }
-            sr["row_fingerprint"] = fingerprint(sr)
-            scratch_rows.append(sr)
-
-    return {
-        "race": race_rows,
-        "entry": entry_rows,
-        "payout": payout_rows,
-        "scratch": scratch_rows,
-    }
+    return {"race": race_rows, "entry": entry_rows, "payout": payout_rows, "scratch": scratch_rows}
 
 
-# -------------------------------------------------
-# Upsert staging
-# -------------------------------------------------
+# -----------------------------
+# Upsert staging tables
+# -----------------------------
 
 
 def _upsert_staging(engine, file_id: int, rows: dict[str, list[dict[str, Any]]]) -> None:
@@ -155,17 +200,16 @@ def _upsert_staging(engine, file_id: int, rows: dict[str, list[dict[str, Any]]])
                     insert into horse_handicapping.stg_chart_race
                     (source_file_id, track_code, race_date, race_number,
                      surface, distance_yards, track_condition,
-                     winning_time, row_fingerprint)
+                     row_fingerprint)
                     values
                     (:fid, :track_code, :race_date, :race_number,
-                     :surface, :distance_yards, :track_condition, 
-                     :winning_time, :row_fingerprint)
+                     :surface, :distance_yards, :track_condition,
+                     :row_fingerprint)
                     on conflict (source_file_id, track_code, race_date, race_number)
                     do update set
                       surface = excluded.surface,
                       distance_yards = excluded.distance_yards,
                       track_condition = excluded.track_condition,
-                      winning_time = excluded.winning_time,
                       row_fingerprint = excluded.row_fingerprint
                 """
                 ),
@@ -239,39 +283,35 @@ def _upsert_staging(engine, file_id: int, rows: dict[str, list[dict[str, Any]]])
             )
 
 
-# -------------------------------------------------
-# CLI entrypoint
-# -------------------------------------------------
+# -----------------------------
+# CLI
+# -----------------------------
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Parse Equibase Chart XML to staging tables")
-    ap.add_argument("xml_path", type=str, help="Path to chart XML file")
-    ap.add_argument("--echo", action="store_true", help="Echo SQL execution")
+    ap = argparse.ArgumentParser(description="Parse Equibase Chart (TCH) XML to staging")
+    ap.add_argument("xml_path", type=str, help="Path to TCH XML file")
+    ap.add_argument("--echo", action="store_true", help="Echo SQL (via engine echo)")
     args = ap.parse_args()
 
     p = Path(args.xml_path).expanduser().resolve()
     if not p.exists():
         raise SystemExit(f"File not found: {p}")
 
+    # Engine
     engine = get_engine(echo=args.echo)
 
-    from hhml.ingest.pp_xml import _defaults_from_filename
-
+    # Defaults from filename
     d_track, d_date = _defaults_from_filename(p)
 
+    # Parse XML
     doc = etree.parse(str(p))
 
-    file_id = register_file(
-        engine,
-        p,  # Path to the XML you’re parsing
-        d_track,  # default track from filename or parsed
-        d_date,  # default date from filename or parsed
-        provider="equibase",
-        file_type="chart",
-    )
+    # Register file and extract rows
+    file_id = register_file(engine, p, d_track, d_date, provider="equibase", ftype="chart")
+    rows = _emit_rows_chart(doc, default_track=d_track, default_date=d_date)
 
-    rows = _emit_rows_chart(doc, d_track, d_date)
+    # Upsert staging
     _upsert_staging(engine, file_id, rows)
 
 
